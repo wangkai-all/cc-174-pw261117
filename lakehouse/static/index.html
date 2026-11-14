@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>本地湖表 · 并发提交与崩溃恢复实验台</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">◧</span>
+    <div>
+      <h1>本地湖表实验台</h1>
+      <p>Parquet 数据文件 + SQLite 元数据 · 乐观并发提交 · 崩溃恢复 · 孤儿回收</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span id="health" class="pill pill-muted">连接中…</span>
+    <button id="btn-refresh" class="btn btn-ghost">刷新状态</button>
+    <button id="btn-reset" class="btn btn-danger">重置演示数据</button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="column left">
+    <div class="card">
+      <div class="card-head">
+        <h2>1 · 创建两个写入任务</h2>
+        <span class="hint">任务只写临时文件并登记提交意图，不立即可见</span>
+      </div>
+      <div class="writers">
+        <div class="writer" id="writer-A">
+          <div class="writer-head"><span class="badge badge-a">写入者 A</span>
+            <span class="writer-state" data-role="state">未创建</span></div>
+          <label class="field">操作
+            <select data-field="type">
+              <option value="append">追加 append</option>
+              <option value="replace">分区替换 replace</option>
+            </select>
+          </label>
+          <div class="field">
+            <span class="field-label">分区</span>
+            <div class="chips" data-field="partitions">
+              <label class="chip"><input type="checkbox" value="us" checked /><span>us</span></label>
+              <label class="chip"><input type="checkbox" value="eu" /><span>eu</span></label>
+              <label class="chip"><input type="checkbox" value="apac" /><span>apac</span></label>
+            </div>
+          </div>
+          <div class="row2">
+            <label class="field">生成行数
+              <input type="number" data-field="rows" value="3" min="0" max="5000" />
+            </label>
+            <label class="field">标签
+              <input type="text" data-field="tag" value="A" maxlength="8" />
+            </label>
+          </div>
+          <label class="field">崩溃注入
+            <select data-field="crash_point" data-role="crash"></select>
+          </label>
+          <div class="writer-actions">
+            <button class="btn btn-primary" data-action="prepare">创建任务</button>
+            <button class="btn btn-outline" data-action="commit" disabled>提交此任务</button>
+          </div>
+          <div class="writer-meta" data-role="meta"></div>
+        </div>
+
+        <div class="writer" id="writer-B">
+          <div class="writer-head"><span class="badge badge-b">写入者 B</span>
+            <span class="writer-state" data-role="state">未创建</span></div>
+          <label class="field">操作
+            <select data-field="type">
+              <option value="append">追加 append</option>
+              <option value="replace">分区替换 replace</option>
+            </select>
+          </label>
+          <div class="field">
+            <span class="field-label">分区</span>
+            <div class="chips" data-field="partitions">
+              <label class="chip"><input type="checkbox" value="us" /><span>us</span></label>
+              <label class="chip"><input type="checkbox" value="eu" checked /><span>eu</span></label>
+              <label class="chip"><input type="checkbox" value="apac" /><span>apac</span></label>
+            </div>
+          </div>
+          <div class="row2">
+            <label class="field">生成行数
+              <input type="number" data-field="rows" value="3" min="0" max="5000" />
+            </label>
+            <label class="field">标签
+              <input type="text" data-field="tag" value="B" maxlength="8" />
+            </label>
+          </div>
+          <label class="field">崩溃注入
+            <select data-field="crash_point" data-role="crash"></select>
+          </label>
+          <div class="writer-actions">
+            <button class="btn btn-primary" data-action="prepare">创建任务</button>
+            <button class="btn btn-outline" data-action="commit" disabled>提交此任务</button>
+          </div>
+          <div class="writer-meta" data-role="meta"></div>
+        </div>
+      </div>
+
+      <div class="commit-order">
+        <h3>2 · 控制提交顺序</h3>
+        <div class="commit-actions">
+          <button class="btn btn-primary" id="btn-commit-ab">先 A 后 B</button>
+          <button class="btn btn-primary" id="btn-commit-ba">先 B 后 A</button>
+          <button class="btn btn-accent" id="btn-commit-both">并发提交（竞态）</button>
+        </div>
+        <p class="hint">两个任务基于同一版本准备时：不重叠的分区可重试合并；同一分区被替换则必须基于新版本重算。</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>3 · 崩溃恢复</h2>
+        <span class="hint">先制造崩溃点，再运行恢复</span>
+      </div>
+      <div class="recover-grid">
+        <button class="btn btn-warn" id="btn-recover">运行恢复流程</button>
+        <button class="btn btn-ghost" id="btn-verify">一致性核对</button>
+      </div>
+      <div id="recovery-out" class="output-block"></div>
+      <div id="verify-out" class="output-block"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>4 · 孤儿文件回收</h2>
+        <span class="hint">提交记录 + 活动租约 + 读者引用，三重检查</span>
+      </div>
+      <div class="recover-grid gc-controls">
+        <label class="field inline">保留版本数
+          <input type="number" id="retain-versions" min="0" max="100" value="0" />
+          <span class="field-note">0 = 保留全部</span>
+        </label>
+        <button class="btn btn-ghost" id="btn-gc-scan">扫描待回收</button>
+        <button class="btn btn-danger" id="btn-gc-reclaim">执行回收</button>
+      </div>
+      <p class="hint">留空“保留版本数”表示不按保留策略修剪版本；填写 N 时只保留最新 N 个版本，旧版本的独占文件进入候选。</p>
+      <div id="gc-out" class="output-block"></div>
+    </div>
+  </section>
+
+  <section class="column right">
+    <div class="card">
+      <div class="card-head">
+        <h2>表版本</h2>
+        <span class="hint">点击版本行，用 DuckDB 实际查询 Parquet</span>
+      </div>
+      <div class="versions-toolbar">
+        <button class="btn btn-ghost" id="btn-query-all">查询每个已提交版本</button>
+        <span class="hint" id="query-all-caption"></span>
+      </div>
+      <div id="versions" class="versions"></div>
+      <div id="query-all-out" class="output-block"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>版本查询结果</h2>
+        <span class="hint" id="query-caption">尚未选择版本</span>
+      </div>
+      <div id="query-out" class="output-block query-out"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>文件引用</h2>
+        <span class="hint">当前 / 历史 / 孤儿文件及其被哪些版本引用</span>
+      </div>
+      <div id="files" class="table-wrap"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>待回收列表</h2>
+        <span class="hint" id="gc-summary"></span>
+      </div>
+      <div id="gc-pending" class="table-wrap"></div>
+      <div class="leases-readers" id="leases-readers"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>写入租约与提交意图</h2></div>
+      <div id="intents" class="table-wrap"></div>
+    </div>
+
+    <div class="card" id="task-log-card">
+      <div class="card-head">
+        <h2>任务日志</h2>
+        <span class="hint" id="task-log-title">创建任务后显示执行细节</span>
+      </div>
+      <div id="task-log" class="output-block task-log"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>事件日志</h2></div>
+      <div id="events" class="events"></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
